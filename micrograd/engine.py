@@ -51,6 +51,16 @@ class Value:
     def __sub__(self, other):  # self - other
         return self + (-other)
     
+    def log(self):
+        x = self.data
+        out = Value(math.log(x), (self, ), 'log')
+
+        def _backward():
+            self.grad += (1 / x) * out.grad
+        out._backward = _backward
+
+        return out
+    
     def __radd__(self, other):
         return self + other
 
