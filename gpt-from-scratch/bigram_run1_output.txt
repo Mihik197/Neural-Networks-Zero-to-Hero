@@ -1,0 +1,42 @@
+# from v1 of bigram model with just embedding table lookup
+
+Given the following hyperparameters:
+batch_size = 32  # how many independent sequences we will process in parallel
+block_size = 8  # max context length
+max_iters = 30000
+eval_interval = 300
+learning_rate = 1e-2  # 10**-2
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters = 200
+# -----------
+
+step 29700: train loss 2.4621, val loss 2.4850
+
+
+CExfik brid owindakis by bth
+
+Hiset bobe d e.
+S:
+O:
+IS:
+Falatanss:
+Wanthar u qur, vet?
+F dilasoate awice my.
+Whastarom oroup
+Yowhthetof isth ble mil ndill, ath iree sengmin lat Heridrovets, and Win nghir.
+Thanousel lind me l.
+HAshe ce hiry:
+Supr aisspllw y.
+Herindu n Boopetelaves
+MP:
+
+Pl, d mothakleo Windo whth eisbyo the m dourive ce higend t so mower; te
+
+AN ad nterupt f s ar igr t m:
+
+Thiny aleronth,
+Mad
+Whed my o myr f-
+LIERor,
+SShisar adsal thes ghesthidin cour ay aney Iry ts I fr t ce.
+J
