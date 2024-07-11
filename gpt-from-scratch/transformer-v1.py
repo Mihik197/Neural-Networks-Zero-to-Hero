@@ -3,14 +3,18 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32  # how many independent sequences we will process in parallel
-block_size = 8  # max context length
+batch_size = 64  # how many independent sequences we will process in parallel
+block_size = 256  # max context length
 max_iters = 5000
-eval_interval = 300
-learning_rate = 1e-3  # 10**-2
+eval_interval = 500
+learning_rate = 3e-4  # 3x10**-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+file_path = 'final_tranformer_output.txt'  # output file path
 # -----------
 
 torch.manual_seed(1337)
@@ -72,6 +76,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))  # buffer means it won't be counted as a parametr of the model
+        self.dropout = nn.Dropout(dropout)  # randomly shuts off some subset of neurons every forward-backward pass to prevent overfitting at train time
 
     def forward(self, x):
         B, T, C = x.shape
@@ -81,11 +86,61 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (B, T, 16) @ (B, 16, T) = (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
         # perform the weighted aggregation of the values
         v = self.value(x)  # now the x is private to each token. the v is the thing that gets aggretated for the purpose of this single head
         out = wei @ v  # (B, T, T) @ (B, T, C) = (B, T, C)
         return out
 
+class MultiHeadAttention(nn.Module):
+    """multiple heads of self-attention in parallel"""
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))  # projection layer going back to the residual pathway
+        return out
+
+# the tokens looked at each but didn't really get a lot of time to think on what they found
+# this is why we introduce these linear layers to give a place to think
+# this is on the per token level, all tokens are thinking independently here
+# self-attention is the communication, and this linear layer is the thinking individually part
+class FeedForward(nn.Module):
+    """a simple linear layer followed by a non-linearity"""
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),  # the inner layer has dimensionality of 4x the input in the paper
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),  # projection layer going back to the residual pathway
+            nn.Dropout(dropout),  # its something you can add right before connecting back to the residual pathway
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """Transformer block: communication followed by computation"""
+
+    def __init__(self, n_embd, n_head):
+        # n_embd: embedding dimension, n_head: the number of heads we'd like
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)  # this is slight deviation from the og paper, but it's current practice to apply layernorm before the transformation
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))  # the 'x +' is for residual connections
+        x = x + self.ffwd(self.ln2(x))  # called the pre-norm formulation
+        return x
 
 # bigram language model
 class BigramLanguageModel(nn.Module):
@@ -95,7 +150,8 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)  # embedding table of containing n_embd dimension vectors
         self.position_embedding_table = nn.Embedding(block_size, n_embd)  # embedding table of the position (out of 8 as block_size, for example)
-        self.sa_head = Head(n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)  # number of inputs and outputs
 
     def forward(self, idx, targets=None):
@@ -105,7 +161,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B, T, C)  the third dimension is the embeddings        
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C) through broadcasting
-        x = self.sa_head(x)  # apply one head of self-attention. (B, T, C) 
+        x = self.blocks(x)  # (B, T, C) 
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets == None:
@@ -144,13 +200,18 @@ m = model.to(device)
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
-
+lossi = []
 for iter in range(max_iters):
 
     # every once in a while evaluate the loss on the train and val sets
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        loss_log = f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+        lossi.append(loss_log)
+        print(loss_log)
+        # Write the loss log to the file
+        with open(file_path, 'a') as f:
+            f.write(loss_log + '\n')
 
     # sample a batch of data
     xb, yb = get_batch('train')
@@ -163,8 +224,11 @@ for iter in range(max_iters):
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+output = decode(m.generate(context, max_new_tokens=10000)[0].tolist())
 
+# save output to a txt file
+with open(file_path, 'a') as f:
+    f.write(output)
 
 # v1 loss: 
 # step 4800: train loss 2.3838, val loss 2.4043
