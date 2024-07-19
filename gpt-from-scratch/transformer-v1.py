@@ -1,3 +1,6 @@
+# This is the modified transformer, with the Head as just one class, unlike in the lecture
+
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -66,44 +69,40 @@ def estimate_loss():
         out[split] = losses.mean()
     model.train()  # set model back to training mode
     return out
+    
+class Attention(nn.Module):
+    """self and multi head attention in one"""
 
-class Head(nn.Module):
-    """one head of self-attention"""
-
-    def __init__(self, head_size):
+    def __init__(self, n_head):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))  # buffer means it won't be counted as a parametr of the model
-        self.dropout = nn.Dropout(dropout)  # randomly shuts off some subset of neurons every forward-backward pass to prevent overfitting at train time
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.head_size = n_embd // n_head  # ex: embd dim: 512, heads: 8, then head size will have to be 64
+
+        self.combined_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.proj = nn.Linear(n_embd, n_embd)
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size).view(1, 1, block_size, block_size)))
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)  # (B, T, C) 
-        q = self.query(x)  # (B, T, C) 
-        # compute attention scores ('affinities')
-        wei = q @ k.transpose(-2, -1) * C**-0.5  # (B, T, 16) @ (B, 16, T) = (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
-        wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x)  # now the x is private to each token. the v is the thing that gets aggretated for the purpose of this single head
-        out = wei @ v  # (B, T, T) @ (B, T, C) = (B, T, C)
-        return out
 
-class MultiHeadAttention(nn.Module):
-    """multiple heads of self-attention in parallel"""
+        qkv = self.combined_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)  # equally split into 3 parts each of n_embd size. Ex: 512
+        k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)  # we reshape them to separate the heads. Ex: 8 heads of 64 each
+        q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)  # on transpose shape becomes (B, n_head, T, head_size), allows us to process all heads in parallel
+        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
+        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))  # (B, n_head, T, head_size) @ (B, n_head, head_size, T) = (B, n_head, T, T)
+        attn = attn.masked_fill(self.tril[:, :, :T, :T] == 0, float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))  # projection layer going back to the residual pathway
+        out = attn @ v
+        out = out.transpose(1, 2).contiguous().view(B, T, C)  # gives (B, T, n_head, head_size), and then concatenates back to original shape
+        out = self.dropout(self.proj(out))
         return out
 
 # the tokens looked at each but didn't really get a lot of time to think on what they found
@@ -131,8 +130,7 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
+        self.sa = Attention(n_head)
         self.ffwd = FeedForward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)  # this is slight deviation from the og paper, but it's current practice to apply layernorm before the transformation
         self.ln2 = nn.LayerNorm(n_embd)
@@ -162,6 +160,7 @@ class BigramLanguageModel(nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T, C)
         x = tok_emb + pos_emb  # (B, T, C) through broadcasting
         x = self.blocks(x)  # (B, T, C) 
+        x = self.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets == None:
@@ -225,10 +224,8 @@ for iter in range(max_iters):
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 output = decode(m.generate(context, max_new_tokens=10000)[0].tolist())
-
+print(output)
 # save output to a txt file
 with open(file_path, 'a') as f:
     f.write(output)
 
-# v1 loss: 
-# step 4800: train loss 2.3838, val loss 2.4043
