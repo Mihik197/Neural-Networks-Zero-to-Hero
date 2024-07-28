@@ -108,6 +108,9 @@ class GPT(nn.Module):
         # we want it to be compatible with gpt2 weights from huggingface transformers
         # ex: transformer.h.0.ln_1.weight torch.Size([768])
 
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
