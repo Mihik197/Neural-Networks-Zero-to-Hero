@@ -82,11 +82,11 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256  # context length
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6  # number of attention heads in each transformer block(layer)
-    n_embd: int = 384
+    block_size: int = 1024  # context length
+    vocab_size: int = 50257  # number of tokens: 256 bytes tokens + 50,000 BPE merges + 1 <|endoftext|>
+    n_layer: int = 12
+    n_head: int = 12  # number of attention heads in each transformer block(layer)
+    n_embd: int = 768
 # dataclass automatically adds special methods to classes like init, repr, etc
 
 class GPT(nn.Module):
@@ -107,3 +107,185 @@ class GPT(nn.Module):
         # ModuleList is used to store an ordered list of nn.Module items
         # we want it to be compatible with gpt2 weights from huggingface transformers
         # ex: transformer.h.0.ln_1.weight torch.Size([768])
+
+    def forward(self, idx, targets=None):
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, f'Cannot forward sequence of length {T}, block size is 1024'
+        # forward the token and position embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # shape (T)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # cross_entropy cannot take in multi-dimensional inputs, which is why we reshape those tensors
+            # cross_entropy(logits, target) where logits -> (B*T, vocab_size), targets -> (B*T)
+        return logits, loss
+
+    @classmethod  # can be called on the class itself, not on instances of the class
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from HuggingFace"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print(f"loading weights from pre-trained gpt: {model_type}")
+
+        # n_layer, n_head, and n_embd are determined from model_type
+        config_args = {
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M parameters
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M parameters
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M parameters
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M parameters
+        }[model_type]
+
+        config_args['vocab_size'] = 50257  # same for all checkpoints
+        config_args['block_size'] = 1024   # same
+
+        # create a from scratch initialized minGPT model
+        config = GPTConfig(**config_args)  # ** unpacks a dict
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask/buffer
+
+        # init a huggingface transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shape
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+    
+# ----------------------------------------------------------
+
+# DataLoader
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store in memory
+        enc = tiktoken.get_encoding('gpt2')
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f'loaded {len(self.tokens)} tokens')
+        print(f'1 epoch = {len(self.tokens) // (B * T)} batches')
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
+        x = buf[:-1].view(B, T)  # inputs
+        y = buf[1:].view(B, T)  # targets
+        # advance the position in the tensor
+        self.current_position += B*T
+        if self.current_position + (B*T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+# ----------------------------------------------------------
+
+# attempt to autodetect device (in case GPU is not available)
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # apple mps (metal performance shaders)
+    device = "mps"
+print(f'using device: {device}')
+
+# get a data batch
+train_loader = DataLoaderLite(B=4, T=32)
+
+
+num_return_sequences = 5
+max_length = 30
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())  # model with randomly initialized weights (not trained)
+print("didn't crash!!!")
+model.eval()
+model.to(device)
+# logits, loss = model(x, y)
+
+# optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()  # update the parameters
+    print(f'step {i}, loss: {loss.item()}')
+
+# print(loss)   
+import sys; sys.exit(0)
+
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)  # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8)  
+# unsqueeze adds extra dimension, at the specified dimension. changes its shape to (1, 8). 
+# repeated 5 times -> (5, 8)
+x = tokens.to('cuda')
+
+# generate. x is (B, T), where B = 5, T = 8
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad():
+        logits = model(x)  # (B, T, vocab_size)
+        # take the logits at the last token in each sequence
+        logits = logits[:, -1, :]  # (B, vocab_size)
+        probs = F.softmax(logits, dim=-1)
+
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from top-k probabilities
+        ix = torch.multinomial(topk_probs, 1)  # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+# print generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
