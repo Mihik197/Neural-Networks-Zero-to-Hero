@@ -34,13 +34,17 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)  
-        # normalizes the attention, so it sums to 1
-        # i.e. for a given token, how important each token is to it, converted to probabilities summing to 1
+        ## Inefficient implementation of Attention
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)  
+        ## normalizes the attention, so it sums to 1
+        ## i.e. for a given token, how important each token is to it, converted to probabilities summing to 1
+        # y = att @ v  # (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)  # weighted sum
+        
+        # Flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        y = att @ v  # (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)  # wieghted sum
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -237,40 +241,63 @@ class DataLoaderLite:
 # ----------------------------------------------------------
 
 # attempt to autodetect device (in case GPU is not available)
+import time
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # apple mps (metal performance shaders)
     device = "mps"
 print(f'using device: {device}')
-
+print(torch.__file__)
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=1024)
+# Batch size 16, 8 were too much for my 1660Ti
+# always choose these sizes in powers of 2
+# something like 17 runs inefficiently on the GPU
+
+torch.set_float32_matmul_precision('high')
+# 1660Ti doesn't support TF32 so this won't work :(
 
 num_return_sequences = 5
 max_length = 30
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())  # model with randomly initialized weights (not trained)
+model = GPT(GPTConfig(vocab_size=50304))  
+# 50304 is much better than 50257. Can be divided by 128. Efficient for lower level stuff
+# model with randomly initialized weights (not trained)
 print("didn't crash!!!")
-model.eval()
+# model.eval()
 model.to(device)
+model = torch.compile(model)
+# I can't use/install triton because its only available on Linux
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 # logits, loss = model(x, y)
 
+
+
 # optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)  # betas and eps from GPT-3 paper
+for step in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):  # bf16 only available on ampere :(
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # sqrt(sum of every gradient's square)
     optimizer.step()  # update the parameters
-    print(f'step {i}, loss: {loss.item()}')
+    torch.cuda.synchronize()  # wait for the GPU to compelete the above task
+    t1 = time.time()
+    dt = (t1 - t0) * 1000  # time difference in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f'step {i} | loss: {loss.item()} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}')
 
 # print(loss)   
 import sys; sys.exit(0)
