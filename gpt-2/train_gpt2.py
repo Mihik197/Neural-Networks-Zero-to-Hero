@@ -278,8 +278,16 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+total_batch_size = 524288  # 2**19, ~0.5M number of tokens
+B = 4  # micro batch size
+T = 1024  # context length
+assert total_batch_size % (B * T) == 0  # total batch size should be divisible by B * T
+grad_accum_steps = total_batch_size // (B * T)
+print(f'total desired batch size: {total_batch_size}')
+print(f'=> calculated gradient accumulation steps: {grad_accum_steps}')
+
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=1024)
+train_loader = DataLoaderLite(B=B, T=T)
 # Batch size 16, 8 were too much for my 1660Ti
 # always choose these sizes in powers of 2
 # something like 17 runs inefficiently on the GPU
@@ -326,12 +334,19 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):  # bf16 only available on ampere :(
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):  # bf16 only available on ampere :(
+            logits, loss = model(x, y)
+        # we scale the loss to account for gradient accumulation
+        # because the gradients just add on each successive backward()
+        # so we scale the loss by dividing it by the number of batches to normalize it
+        loss = loss / grad_accum_steps  # normalization step
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # sqrt(sum of every gradient's square)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
@@ -341,8 +356,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()  # wait for the GPU to compelete the above task
     t1 = time.time()
     dt = (t1 - t0) * 1000  # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f'step {i} | loss: {loss.item()} | lr: {lr:4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}')
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f'step {step} | loss: {loss_accum.item():.6f} | lr: {lr:4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}')
 
 # print(loss)   
 import sys; sys.exit(0)
