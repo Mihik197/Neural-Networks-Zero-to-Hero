@@ -287,6 +287,7 @@ class DataLoaderLite:
 # -------------------------------------------------------------------------------
 # helper function for HellaSwag eval
 # takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+from hellaswag import render_example, iterate_examples
 
 def get_most_likely_row(tokens, mask, logits):
     # evaluate the autoregressive loss at all positions
